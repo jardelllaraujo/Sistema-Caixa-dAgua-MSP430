@@ -1,0 +1,528 @@
+// Universidade de Brasilia
+// Nome: Jardell Araujo da Silva
+// Matricula: 202043989
+
+
+#include <msp430.h>
+#include <stdint.h>
+
+// ================= LCD I2C =================
+
+#define LCD_ADDR 0x27
+#define RS 0x01
+#define EN 0x04
+#define BL 0x08
+
+// ================= PINOS =================
+
+#define SENSOR_CAIXA BIT0      // P6.0 / A0
+
+#define SENSOR_CISTERNA  BIT0  // P2.0
+#define BOTAO_EMERGENCIA BIT2  // P2.2
+#define BOTAO_MANUAL     BIT3  // P2.3
+#define BOTAO_MODO       BIT6  // P2.6
+
+#define RELE_BOMBA       BIT2  // P1.2
+#define LED_CIST_AGUA    BIT3  // P1.3
+#define BUZZER           BIT4  // P1.4
+
+#define LED_CAIXA_CHEIA  BIT0  // P4.0
+
+#define LED_CAIXA_VAZIA  BIT5  // P3.5
+#define LED_CIST_VAZIA   BIT6  // P3.6
+#define LED_BOMBA        BIT7  // P3.7
+
+// ================= AJUSTES =================
+
+#define SENSOR_MIN 950
+#define SENSOR_MAX 1530
+
+#define NIVEL_LIGA_BOMBA 30
+#define NIVEL_DESLIGA_BOMBA 90
+#define NIVEL_LED_VERDE_CAIXA 60
+
+#define RELE_ATIVO_ALTO 0
+#define BUZZER_ATIVO_ALTO 1
+
+#define NUM_LEITURAS_ADC 20
+#define VARIACAO_LCD 2
+
+// ================= VARIAVEIS =================
+
+volatile unsigned int nivel_adc = 0;
+volatile unsigned int nivel_percentual = 0;
+volatile unsigned int nivel_percentual_lcd = 0;
+
+unsigned char modo_automatico = 1;
+unsigned char bomba_manual = 0;
+unsigned char bomba_ligada = 0;
+unsigned char emergencia = 0;
+unsigned char lcd_primeira_leitura = 1;
+
+// ================= I2C / LCD =================
+
+void i2cInit(void)
+{
+    UCB0CTL1 |= UCSWRST;
+    UCB0CTL0 = UCMST | UCMODE_3 | UCSYNC;
+    UCB0CTL1 = UCSWRST | UCSSEL__SMCLK;
+    UCB0BRW = 10;
+
+    P3SEL |= BIT0 | BIT1;
+
+    UCB0CTL1 &= ~UCSWRST;
+}
+
+void i2cSend(uint8_t data)
+{
+    UCB0I2CSA = LCD_ADDR;
+    UCB0CTL1 |= UCTR | UCTXSTT;
+
+    while (!(UCB0IFG & UCTXIFG));
+    UCB0TXBUF = data;
+
+    while (UCB0CTL1 & UCTXSTT);
+
+    UCB0CTL1 |= UCTXSTP;
+    while (UCB0CTL1 & UCTXSTP);
+}
+
+void lcdWriteNibble(uint8_t nibble, uint8_t isChar)
+{
+    uint8_t data;
+
+    data = ((nibble & 0x0F) << 4) | BL;
+
+    if (isChar)
+        data |= RS;
+
+    i2cSend(data & ~EN);
+    i2cSend(data | EN);
+    i2cSend(data & ~EN);
+}
+
+void lcdWriteByte(uint8_t byte, uint8_t isChar)
+{
+    lcdWriteNibble(byte >> 4, isChar);
+    lcdWriteNibble(byte, isChar);
+    __delay_cycles(2000);
+}
+
+void lcdInit(void)
+{
+    __delay_cycles(50000);
+
+    lcdWriteNibble(0x03, 0);
+    __delay_cycles(50000);
+    lcdWriteNibble(0x03, 0);
+    __delay_cycles(50000);
+    lcdWriteNibble(0x03, 0);
+    __delay_cycles(50000);
+    lcdWriteNibble(0x02, 0);
+
+    lcdWriteByte(0x28, 0);
+    lcdWriteByte(0x0C, 0);
+    lcdWriteByte(0x06, 0);
+    lcdWriteByte(0x01, 0);
+
+    __delay_cycles(50000);
+}
+
+void lcdClear(void)
+{
+    lcdWriteByte(0x01, 0);
+    __delay_cycles(50000);
+}
+
+void lcdSetCursor(unsigned char linha, unsigned char coluna)
+{
+    if (linha == 0)
+        lcdWriteByte(0x80 + coluna, 0);
+    else
+        lcdWriteByte(0xC0 + coluna, 0);
+}
+
+void lcdWrite(char *str)
+{
+    while (*str != '\0')
+    {
+        lcdWriteByte(*str, 1);
+        str++;
+    }
+}
+
+void lcdWriteNumber(unsigned int num)
+{
+    unsigned char centena, dezena, unidade;
+
+    centena = num / 100;
+    dezena = (num / 10) % 10;
+    unidade = num % 10;
+
+    if (centena > 0)
+        lcdWriteByte(centena + '0', 1);
+
+    if (centena > 0 || dezena > 0)
+        lcdWriteByte(dezena + '0', 1);
+
+    lcdWriteByte(unidade + '0', 1);
+}
+
+// ================= ADC =================
+
+void adcInit(void)
+{
+    P6SEL |= SENSOR_CAIXA;
+
+    ADC12CTL0 &= ~ADC12ENC;
+
+    ADC12CTL0 = ADC12ON | ADC12SHT0_8;
+    ADC12CTL1 = ADC12SHP;
+    ADC12CTL2 = ADC12RES_2;
+
+    ADC12MCTL0 = ADC12INCH_0;
+
+    ADC12CTL0 |= ADC12ENC;
+}
+
+unsigned int adcReadA0(void)
+{
+    unsigned long soma = 0;
+    unsigned char i;
+
+    for (i = 0; i < NUM_LEITURAS_ADC; i++)
+    {
+        ADC12CTL0 |= ADC12SC;
+
+        while (ADC12CTL1 & ADC12BUSY);
+
+        soma += ADC12MEM0;
+
+        __delay_cycles(2000);
+    }
+
+    return soma / NUM_LEITURAS_ADC;
+}
+
+unsigned int calculaPercentual(unsigned int leitura)
+{
+    if (leitura <= SENSOR_MIN)
+        return 0;
+
+    if (leitura >= SENSOR_MAX)
+        return 100;
+
+    return ((leitura - SENSOR_MIN) * 100UL) / (SENSOR_MAX - SENSOR_MIN);
+}
+
+void atualizaPercentualLCD(void)
+{
+    int diferenca;
+
+    if (lcd_primeira_leitura)
+    {
+        nivel_percentual_lcd = nivel_percentual;
+        lcd_primeira_leitura = 0;
+        return;
+    }
+
+    diferenca = (int)nivel_percentual - (int)nivel_percentual_lcd;
+
+    if (diferenca < 0)
+        diferenca = -diferenca;
+
+    if (diferenca >= VARIACAO_LCD)
+        nivel_percentual_lcd = nivel_percentual;
+}
+
+// ================= GPIO =================
+
+void gpioInit(void)
+{
+    P1DIR |= RELE_BOMBA | LED_CIST_AGUA | BUZZER;
+    P1OUT &= ~(LED_CIST_AGUA | BUZZER);
+
+#if RELE_ATIVO_ALTO
+    P1OUT &= ~RELE_BOMBA;
+#else
+    P1OUT |= RELE_BOMBA;
+#endif
+
+    P4DIR |= LED_CAIXA_CHEIA;
+    P4OUT &= ~LED_CAIXA_CHEIA;
+
+    P3DIR |= LED_CAIXA_VAZIA | LED_CIST_VAZIA | LED_BOMBA;
+    P3OUT &= ~(LED_CAIXA_VAZIA | LED_CIST_VAZIA | LED_BOMBA);
+
+    P2DIR &= ~(SENSOR_CISTERNA | BOTAO_EMERGENCIA | BOTAO_MANUAL | BOTAO_MODO);
+    P2REN |=  (SENSOR_CISTERNA | BOTAO_EMERGENCIA | BOTAO_MANUAL | BOTAO_MODO);
+    P2OUT |=  (SENSOR_CISTERNA | BOTAO_EMERGENCIA | BOTAO_MANUAL | BOTAO_MODO);
+}
+
+// ================= FUNCOES DO SISTEMA =================
+
+unsigned char cisternaTemAgua(void)
+{
+    if (P2IN & SENSOR_CISTERNA)
+        return 1;
+    else
+        return 0;
+}
+
+void ligaBomba(void)
+{
+#if RELE_ATIVO_ALTO
+    P1OUT |= RELE_BOMBA;
+#else
+    P1OUT &= ~RELE_BOMBA;
+#endif
+
+    P3OUT |= LED_BOMBA;
+    bomba_ligada = 1;
+}
+
+void desligaBomba(void)
+{
+#if RELE_ATIVO_ALTO
+    P1OUT &= ~RELE_BOMBA;
+#else
+    P1OUT |= RELE_BOMBA;
+#endif
+
+    P3OUT &= ~LED_BOMBA;
+    bomba_ligada = 0;
+}
+
+void ligaBuzzer(void)
+{
+#if BUZZER_ATIVO_ALTO
+    P1OUT |= BUZZER;
+#else
+    P1OUT &= ~BUZZER;
+#endif
+}
+
+void desligaBuzzer(void)
+{
+#if BUZZER_ATIVO_ALTO
+    P1OUT &= ~BUZZER;
+#else
+    P1OUT |= BUZZER;
+#endif
+}
+
+void buzzerIntermitente(void)
+{
+    static unsigned int contador = 0;
+
+    contador++;
+
+    if (contador >= 7)
+    {
+        P1OUT ^= BUZZER;
+        contador = 0;
+    }
+}
+
+void verificaBotaoModo(void)
+{
+    static unsigned char estado_anterior = 1;
+    unsigned char estado_atual;
+
+    estado_atual = P2IN & BOTAO_MODO;
+
+    if (estado_anterior && !estado_atual)
+    {
+        modo_automatico = !modo_automatico;
+        bomba_manual = 0;
+        desligaBomba();
+        __delay_cycles(300000);
+    }
+
+    estado_anterior = estado_atual;
+}
+
+void verificaBotaoManual(void)
+{
+    static unsigned char estado_anterior = 1;
+    unsigned char estado_atual;
+
+    estado_atual = P2IN & BOTAO_MANUAL;
+
+    if (estado_anterior && !estado_atual)
+    {
+        bomba_manual = !bomba_manual;
+        __delay_cycles(300000);
+    }
+
+    estado_anterior = estado_atual;
+}
+
+void verificaBotaoEmergencia(void)
+{
+    static unsigned char estado_anterior = 1;
+    unsigned char estado_atual;
+
+    estado_atual = P2IN & BOTAO_EMERGENCIA;
+
+    if (estado_anterior && !estado_atual)
+    {
+        emergencia = !emergencia;
+
+        if (emergencia)
+        {
+            bomba_manual = 0;
+            desligaBomba();
+        }
+        else
+        {
+            desligaBuzzer();
+        }
+
+        __delay_cycles(300000);
+    }
+
+    estado_anterior = estado_atual;
+}
+
+void atualizaLeds(unsigned char tem_agua)
+{
+    if (tem_agua)
+    {
+        P1OUT |= LED_CIST_AGUA;
+        P3OUT &= ~LED_CIST_VAZIA;
+    }
+    else
+    {
+        P1OUT &= ~LED_CIST_AGUA;
+        P3OUT |= LED_CIST_VAZIA;
+    }
+
+    if (nivel_percentual >= NIVEL_LED_VERDE_CAIXA)
+    {
+        P4OUT |= LED_CAIXA_CHEIA;
+        P3OUT &= ~LED_CAIXA_VAZIA;
+    }
+    else if (nivel_percentual <= NIVEL_LIGA_BOMBA)
+    {
+        P4OUT &= ~LED_CAIXA_CHEIA;
+        P3OUT |= LED_CAIXA_VAZIA;
+    }
+    else
+    {
+        P4OUT &= ~LED_CAIXA_CHEIA;
+        P3OUT &= ~LED_CAIXA_VAZIA;
+    }
+}
+
+void atualizaLCD(unsigned char tem_agua)
+{
+    lcdClear();
+
+    lcdSetCursor(0, 0);
+    lcdWrite("Nivel: ");
+    lcdWriteNumber(nivel_percentual_lcd);
+    lcdWrite("%");
+
+    lcdSetCursor(1, 0);
+
+    if (emergencia)
+        lcdWrite("EMERGENCIA");
+    else if (!tem_agua)
+        lcdWrite("Sem agua cist.");
+    else if (modo_automatico)
+        lcdWrite("Modo: Auto");
+    else
+    {
+        if (bomba_manual)
+            lcdWrite("Manual: Ligada");
+        else
+            lcdWrite("Manual: Deslig");
+    }
+}
+
+void controleSistema(void)
+{
+    unsigned char tem_agua;
+
+    nivel_adc = adcReadA0();
+    nivel_percentual = calculaPercentual(nivel_adc);
+    atualizaPercentualLCD();
+
+    tem_agua = cisternaTemAgua();
+
+    verificaBotaoEmergencia();
+
+    if (emergencia)
+    {
+        desligaBomba();
+        buzzerIntermitente();
+        atualizaLeds(tem_agua);
+        atualizaLCD(tem_agua);
+        return;
+    }
+
+    verificaBotaoModo();
+
+    if (!modo_automatico)
+        verificaBotaoManual();
+
+    atualizaLeds(tem_agua);
+
+    if (!tem_agua)
+    {
+        desligaBomba();
+        bomba_manual = 0;
+        buzzerIntermitente();
+        atualizaLCD(tem_agua);
+        return;
+    }
+    else
+    {
+        desligaBuzzer();
+    }
+
+    if (modo_automatico)
+    {
+        if (nivel_percentual <= NIVEL_LIGA_BOMBA)
+            ligaBomba();
+        else if (nivel_percentual >= NIVEL_DESLIGA_BOMBA)
+            desligaBomba();
+    }
+    else
+    {
+        if (bomba_manual)
+            ligaBomba();
+        else
+            desligaBomba();
+    }
+
+    atualizaLCD(tem_agua);
+}
+
+// ================= MAIN =================
+
+int main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;
+
+    gpioInit();
+    adcInit();
+    i2cInit();
+    lcdInit();
+
+    desligaBomba();
+    desligaBuzzer();
+
+    lcdClear();
+    lcdWrite("Sistema Agua");
+    lcdSetCursor(1, 0);
+    lcdWrite("Iniciando...");
+    __delay_cycles(1000000);
+
+    while (1)
+    {
+        controleSistema();
+        __delay_cycles(100000);
+    }
+}
