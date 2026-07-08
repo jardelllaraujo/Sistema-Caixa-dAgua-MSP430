@@ -2,7 +2,6 @@
 // Nome: Jardell Araujo da Silva
 // Matricula: 202043989
 
-
 #include <msp430.h>
 #include <stdint.h>
 
@@ -35,7 +34,7 @@
 // ================= AJUSTES =================
 
 #define SENSOR_MIN 950
-#define SENSOR_MAX 1530
+#define SENSOR_MAX 1950
 
 #define NIVEL_LIGA_BOMBA 30
 #define NIVEL_DESLIGA_BOMBA 90
@@ -44,28 +43,27 @@
 #define RELE_ATIVO_ALTO 0
 #define BUZZER_ATIVO_ALTO 1
 
-#define NUM_LEITURAS_ADC 20
-#define VARIACAO_LCD 2
+#define NUM_LEITURAS_ADC 5   // Media de 5 medidas
+#define CONFIRMA_CHEIO 8    // Bomba desliga depois de 8 ciclos de 90%
 
 // ================= VARIAVEIS =================
 
 volatile unsigned int nivel_adc = 0;
 volatile unsigned int nivel_percentual = 0;
-volatile unsigned int nivel_percentual_lcd = 0;
 
 unsigned char modo_automatico = 1;
 unsigned char bomba_manual = 0;
 unsigned char bomba_ligada = 0;
 unsigned char emergencia = 0;
-unsigned char lcd_primeira_leitura = 1;
 
 // ================= I2C / LCD =================
 
+// Função
 void i2cInit(void)
 {
     UCB0CTL1 |= UCSWRST;
     UCB0CTL0 = UCMST | UCMODE_3 | UCSYNC;
-    UCB0CTL1 = UCSWRST | UCSSEL__SMCLK;
+    UCB0CTL1 = UCSWRST | UCSSEL__SMCLK;      // SMCLK
     UCB0BRW = 10;
 
     P3SEL |= BIT0 | BIT1;
@@ -73,7 +71,8 @@ void i2cInit(void)
     UCB0CTL1 &= ~UCSWRST;
 }
 
-void i2cSend(uint8_t data)
+//  Envia as informações de 1 byte  para o LCD
+void i2cSend(uint8_t data)     
 {
     UCB0I2CSA = LCD_ADDR;
     UCB0CTL1 |= UCTR | UCTXSTT;
@@ -87,6 +86,7 @@ void i2cSend(uint8_t data)
     while (UCB0CTL1 & UCTXSTP);
 }
 
+//Envia 4 bits (Nibble)
 void lcdWriteNibble(uint8_t nibble, uint8_t isChar)
 {
     uint8_t data;
@@ -101,6 +101,7 @@ void lcdWriteNibble(uint8_t nibble, uint8_t isChar)
     i2cSend(data & ~EN);
 }
 
+// Envio de um byte inteiro 
 void lcdWriteByte(uint8_t byte, uint8_t isChar)
 {
     lcdWriteNibble(byte >> 4, isChar);
@@ -108,6 +109,7 @@ void lcdWriteByte(uint8_t byte, uint8_t isChar)
     __delay_cycles(2000);
 }
 
+// Função para inicalizar o LCD
 void lcdInit(void)
 {
     __delay_cycles(50000);
@@ -128,12 +130,14 @@ void lcdInit(void)
     __delay_cycles(50000);
 }
 
+// Função para enviar apenas um comando ao LCD
 void lcdClear(void)
 {
     lcdWriteByte(0x01, 0);
     __delay_cycles(50000);
 }
 
+// Função para posicionar o cursor
 void lcdSetCursor(unsigned char linha, unsigned char coluna)
 {
     if (linha == 0)
@@ -142,6 +146,7 @@ void lcdSetCursor(unsigned char linha, unsigned char coluna)
         lcdWriteByte(0xC0 + coluna, 0);
 }
 
+// Função para enviar uma palavra inteira
 void lcdWrite(char *str)
 {
     while (*str != '\0')
@@ -151,6 +156,7 @@ void lcdWrite(char *str)
     }
 }
 
+// Função para escrever numeros 
 void lcdWriteNumber(unsigned int num)
 {
     unsigned char centena, dezena, unidade;
@@ -169,7 +175,9 @@ void lcdWriteNumber(unsigned int num)
 }
 
 // ================= ADC =================
+ // Analógico para digital - Pino P6.0
 
+ // Função que configura o conversor A/D
 void adcInit(void)
 {
     P6SEL |= SENSOR_CAIXA;
@@ -185,6 +193,7 @@ void adcInit(void)
     ADC12CTL0 |= ADC12ENC;
 }
 
+// Função que faz a leitura do sensor 
 unsigned int adcReadA0(void)
 {
     unsigned long soma = 0;
@@ -198,12 +207,13 @@ unsigned int adcReadA0(void)
 
         soma += ADC12MEM0;
 
-        __delay_cycles(2000);
+        __delay_cycles(1000);
     }
 
     return soma / NUM_LEITURAS_ADC;
 }
 
+// Função que Converte para porcentagem 
 unsigned int calculaPercentual(unsigned int leitura)
 {
     if (leitura <= SENSOR_MIN)
@@ -215,28 +225,11 @@ unsigned int calculaPercentual(unsigned int leitura)
     return ((leitura - SENSOR_MIN) * 100UL) / (SENSOR_MAX - SENSOR_MIN);
 }
 
-void atualizaPercentualLCD(void)
-{
-    int diferenca;
-
-    if (lcd_primeira_leitura)
-    {
-        nivel_percentual_lcd = nivel_percentual;
-        lcd_primeira_leitura = 0;
-        return;
-    }
-
-    diferenca = (int)nivel_percentual - (int)nivel_percentual_lcd;
-
-    if (diferenca < 0)
-        diferenca = -diferenca;
-
-    if (diferenca >= VARIACAO_LCD)
-        nivel_percentual_lcd = nivel_percentual;
-}
 
 // ================= GPIO =================
+// Entradas e Saídas de Uso Geral
 
+// Função que configura todos os pinos antres do programa começar
 void gpioInit(void)
 {
     P1DIR |= RELE_BOMBA | LED_CIST_AGUA | BUZZER;
@@ -259,8 +252,10 @@ void gpioInit(void)
     P2OUT |=  (SENSOR_CISTERNA | BOTAO_EMERGENCIA | BOTAO_MANUAL | BOTAO_MODO);
 }
 
+
 // ================= FUNCOES DO SISTEMA =================
 
+// Função que transform a leitura do sensor em informação logica 
 unsigned char cisternaTemAgua(void)
 {
     if (P2IN & SENSOR_CISTERNA)
@@ -269,6 +264,7 @@ unsigned char cisternaTemAgua(void)
         return 0;
 }
 
+// Controle da bmba
 void ligaBomba(void)
 {
 #if RELE_ATIVO_ALTO
@@ -293,6 +289,7 @@ void desligaBomba(void)
     bomba_ligada = 0;
 }
 
+// Controle do Buzzer
 void ligaBuzzer(void)
 {
 #if BUZZER_ATIVO_ALTO
@@ -324,6 +321,9 @@ void buzzerIntermitente(void)
     }
 }
 
+// Controle dos Botões 
+
+// Modo manual/automatico
 void verificaBotaoModo(void)
 {
     static unsigned char estado_anterior = 1;
@@ -342,6 +342,7 @@ void verificaBotaoModo(void)
     estado_anterior = estado_atual;
 }
 
+// Manual: Ligado/Desligado
 void verificaBotaoManual(void)
 {
     static unsigned char estado_anterior = 1;
@@ -358,6 +359,7 @@ void verificaBotaoManual(void)
     estado_anterior = estado_atual;
 }
 
+// Botão de Emergencia
 void verificaBotaoEmergencia(void)
 {
     static unsigned char estado_anterior = 1;
@@ -385,6 +387,7 @@ void verificaBotaoEmergencia(void)
     estado_anterior = estado_atual;
 }
 
+// Função para atualização dos LEDs
 void atualizaLeds(unsigned char tem_agua)
 {
     if (tem_agua)
@@ -415,42 +418,44 @@ void atualizaLeds(unsigned char tem_agua)
     }
 }
 
+// Função que atualiza o LCD com o estado atual 
 void atualizaLCD(unsigned char tem_agua)
 {
-    lcdClear();
-
     lcdSetCursor(0, 0);
     lcdWrite("Nivel: ");
-    lcdWriteNumber(nivel_percentual_lcd);
-    lcdWrite("%");
+    lcdWriteNumber(nivel_percentual);
+    lcdWrite("%   ");
 
     lcdSetCursor(1, 0);
 
     if (emergencia)
-        lcdWrite("EMERGENCIA");
+        lcdWrite("EMERGENCIA       ");
     else if (!tem_agua)
-        lcdWrite("Sem agua cist.");
+        lcdWrite("Sem agua cist.   ");
     else if (modo_automatico)
-        lcdWrite("Modo: Auto");
+        lcdWrite("Modo: Auto       ");
     else
     {
         if (bomba_manual)
-            lcdWrite("Manual: Ligada");
+            lcdWrite("Manual: Ligada   ");
         else
-            lcdWrite("Manual: Deslig");
+            lcdWrite("Manual: Deslig   ");
     }
 }
 
+// Controle do sistema 
+
 void controleSistema(void)
 {
+    static unsigned char cont_cheio = 0;
     unsigned char tem_agua;
 
     nivel_adc = adcReadA0();
     nivel_percentual = calculaPercentual(nivel_adc);
-    atualizaPercentualLCD();
 
     tem_agua = cisternaTemAgua();
 
+// Verifica estado do botão de emergencia
     verificaBotaoEmergencia();
 
     if (emergencia)
@@ -462,6 +467,7 @@ void controleSistema(void)
         return;
     }
 
+// Verifica estado do botão de modo: manual/automatico
     verificaBotaoModo();
 
     if (!modo_automatico)
@@ -473,6 +479,7 @@ void controleSistema(void)
     {
         desligaBomba();
         bomba_manual = 0;
+        cont_cheio = 0;
         buzzerIntermitente();
         atualizaLCD(tem_agua);
         return;
@@ -485,12 +492,29 @@ void controleSistema(void)
     if (modo_automatico)
     {
         if (nivel_percentual <= NIVEL_LIGA_BOMBA)
+        {
             ligaBomba();
+            cont_cheio = 0;
+        }
         else if (nivel_percentual >= NIVEL_DESLIGA_BOMBA)
-            desligaBomba();
+        {
+            cont_cheio++;
+
+            if (cont_cheio >= CONFIRMA_CHEIO)
+            {
+                desligaBomba();
+                cont_cheio = 0;
+            }
+        }
+        else
+        {
+            cont_cheio = 0;
+        }
     }
     else
     {
+        cont_cheio = 0;
+
         if (bomba_manual)
             ligaBomba();
         else
@@ -506,10 +530,10 @@ int main(void)
 {
     WDTCTL = WDTPW | WDTHOLD;
 
-    gpioInit();
-    adcInit();
-    i2cInit();
-    lcdInit();
+    gpioInit();     // Inicia os periféricos
+    adcInit();      //   --      Conversor A/D
+    i2cInit();      //   --      I2C
+    lcdInit();      //   --      display LCD
 
     desligaBomba();
     desligaBuzzer();
